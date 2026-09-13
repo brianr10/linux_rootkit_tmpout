@@ -71,4 +71,4 @@ static void __exit rootkit_exit(void)
 }
 
 module_init(rootkit_init);
-module_exit(rootkit_exit);#include <linux/init.h>
+module_exit(rootkit_exit);
