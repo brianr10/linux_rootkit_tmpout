@@ -1,0 +1,7 @@
+CompileFlags:
+  Add: [-std=gnu89, -Dnotrace=, -include, stdbool.h]
+
+If:
+  PathMatch: .*\.h
+CompileFlags:
+  Add: [-x, c]
