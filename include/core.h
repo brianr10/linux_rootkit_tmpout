@@ -68,4 +68,8 @@
 #include <linux/hardirq.h>
 #include <linux/kobject.h>
 #include <linux/perf_event.h>
+#include <stddef.h>
+#include <stdint.h>
+
+int memcpy_sp(void *dst, size_t dst_size, const void *src, size_t src_len);
 #endif

