@@ -1,0 +1,25 @@
+# What I Learned
+---
+
+## Capability
+### Basic Function Hooking
+- Initially I didn't understand why we have to use function pointers, especially when it came to function hooking.
+
+### Becoming Root Capability
+```
+We have to hook the `kill` linux command ...
+```
+
+## Things I do ***NOT*** understand
+- Why we use `kprobe`.
+- `within_module()` function. I have never seen this before.
+- spinlock & why we use it in this context (I forgot my OS class material over the past 4 years lol).
+- This line of code: `orig_register_kprobe = (int (*)(struct kprobe*))addr`.
+- Not sure what `iomem` is.
+
+# References
+1. https://phrack.org/issues/73/the-art-of-staying-hidden_md#article
+2. https://tmpout.sh/4/10.html
+3. https://sysprog21.github.io/lkmpg/
+4. https://github.com/MatheuZSecurity/Singularity
+5. https://xcellerator.github.io/posts/linux_rootkits_02/

