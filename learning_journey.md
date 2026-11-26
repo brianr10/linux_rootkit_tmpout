@@ -16,6 +16,7 @@ We have to hook the `kill` linux command ...
 - spinlock & why we use it in this context (I forgot my OS class material over the past 4 years lol).
 - This line of code: `orig_register_kprobe = (int (*)(struct kprobe*))addr`.
 - Not sure what `iomem` is.
+- wtf is `copy_mc_to_kernel`?
 
 # References
 1. https://phrack.org/issues/73/the-art-of-staying-hidden_md#article
@@ -23,3 +24,6 @@ We have to hook the `kill` linux command ...
 3. https://sysprog21.github.io/lkmpg/
 4. https://github.com/MatheuZSecurity/Singularity
 5. https://xcellerator.github.io/posts/linux_rootkits_02/
+6. https://h0mbre.github.io/Learn-C-By-Creating-A-Rootkit/
+
+###### Quickly realizing I know nothing about rootkits...
